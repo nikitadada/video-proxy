@@ -1,52 +1,104 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"github.com/pions/webrtc/pkg/rtp"
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
 	"net"
+	"net/http"
 )
 
-func main() {
-	srcAddr := "127.0.0.1:5000"
-	dstAddr := "127.0.0.1:5001"
+// Глобальный трек, чтобы все клиенты могли подключиться к одному источнику
+var videoTrack *webrtc.TrackLocalStaticRTP
 
-	// 1. Создаем UDP-сервер для прослушивания входящего потока от FFmpeg
-	lAddr, _ := net.ResolveUDPAddr("udp", srcAddr)
-	conn, err := net.ListenUDP("udp", lAddr)
+func main() {
+	var err error
+
+	// 1. Инициализируем видеотрек ОДИН РАЗ при старте
+	videoTrack, err = webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "pion",
+	)
 	if err != nil {
 		panic(err)
 	}
+
+	// 2. Запускаем UDP-приемник в отдельной горутине (Ingest)
+	// Он будет работать вечно, даже если FFmpeg перезапускается
+	go startUDPListener()
+
+	// 3. Раздача статики
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "index.html")
+	})
+
+	// 4. Signaling API
+	http.HandleFunc("/webrtc", webrtcHandler)
+
+	fmt.Println("Сервер: http://localhost:8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		panic(err)
+	}
+}
+
+func startUDPListener() {
+	udpAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:5000")
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		fmt.Printf("Ошибка: не удалось занять порт 5000: %v\n", err)
+		return
+	}
 	defer conn.Close()
 
-	// 2. Создаем UDP-сокет для отправки (без жесткой привязки Dial)
-	rAddr, _ := net.ResolveUDPAddr("udp", dstAddr)
-	// Отправляем пакеты с любого свободного порта
-	sendConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	defer sendConn.Close()
+	fmt.Println("UDP-приемник готов на порту 5000 (жду FFmpeg)")
 
-	fmt.Printf("🚀 Proxy started: %s -> %s\n", srcAddr, dstAddr)
-
-	buf := make([]byte, 2048)
-	packet := &rtp.Packet{}
-
+	buf := make([]byte, 1500)
 	for {
-		// Читаем пакет от FFmpeg
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			fmt.Println("Read error:", err)
+			fmt.Printf("Ошибка чтения UDP: %v\n", err)
 			continue
 		}
 
-		// Пытаемся распарсить заголовок RTP для статистики
+		// Распаковываем RTP пакет
+		packet := &rtp.Packet{}
 		if err := packet.Unmarshal(buf[:n]); err == nil {
-			fmt.Printf("📦 Packet: Seq=%d, TS=%d, Size=%d\n",
-				packet.SequenceNumber, packet.Timestamp, n)
-		}
-
-		// Отправляем пакет в сторону VLC
-		_, err = sendConn.WriteToUDP(buf[:n], rAddr)
-		if err != nil {
-			fmt.Println("Write error:", err)
+			// Транслируем всем подключенным WebRTC клиентам
+			videoTrack.WriteRTP(packet)
 		}
 	}
+}
+
+func webrtcHandler(w http.ResponseWriter, r *http.Request) {
+	var offer webrtc.SessionDescription
+	if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
+		return
+	}
+
+	// Настройка соединения
+	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
+	})
+	if err != nil {
+		return
+	}
+
+	// Добавляем наш глобальный трек к этому конкретному соединению
+	if _, err = peerConnection.AddTrack(videoTrack); err != nil {
+		return
+	}
+
+	// Стандартный Handshake
+	peerConnection.SetRemoteDescription(offer)
+	answer, _ := peerConnection.CreateAnswer(nil)
+
+	// Ждем сбора кандидатов (Gathering)
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+	peerConnection.SetLocalDescription(answer)
+	<-gatherComplete
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(peerConnection.LocalDescription())
+
+	fmt.Printf("Новый зритель подключен! (Remote IP: %s)\n", r.RemoteAddr)
 }

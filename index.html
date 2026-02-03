@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Go WebRTC Proxy</title>
+</head>
+<body style="background: #1a1a1a; color: white; font-family: sans-serif; text-align: center;">
+<h2>WebRTC Stream from Go</h2>
+<video id="video" autoplay playsinline controls style="width: 80%; border: 2px solid #333;"></video>
+
+<script>
+    const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    // Как только получаем трек от сервера — цепляем его в <video>
+    pc.ontrack = (event) => {
+        console.log("📺 Получен медиа-трек");
+        document.getElementById('video').srcObject = event.streams[0];
+    };
+
+    // Говорим, что только принимаем видео
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    // Создаем Offer и шлем его на Go-сервер
+    pc.createOffer()
+        .then(offer => pc.setLocalDescription(offer))
+        .then(() => fetch('/webrtc', {
+            method: 'POST',
+            body: JSON.stringify(pc.localDescription)
+        }))
+        .then(res => res.json())
+        .then(answer => pc.setRemoteDescription(answer))
+        .catch(console.error);
+</script>
+</body>
+</html>
