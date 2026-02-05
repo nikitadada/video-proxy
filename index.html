@@ -1,80 +1,95 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WebRTC Echo Fix</title>
+    <title>WebRTC SFU Final Debug</title>
 </head>
 <body style="background: #121212; color: white; font-family: sans-serif; text-align: center;">
-<h1>WebRTC Echo Test (Final Fix)</h1>
-<div style="display: flex; justify-content: center; gap: 20px;">
-    <div>
-        <p>Local Camera</p>
-        <video id="localVideo" autoplay muted playsinline style="width: 400px; border: 2px solid #ff4444; background: black;"></video>
-    </div>
-    <div>
-        <p>Remote Echo</p>
-        <video id="remoteVideo" autoplay playsinline style="width: 400px; border: 2px solid #44ff44; background: black;"></video>
-    </div>
+<h1>Room: <span id="rname"></span></h1>
+<div id="grid" style="display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; padding: 20px;">
+    <video id="local" autoplay muted playsinline style="width: 300px; border: 2px solid red; border-radius: 8px;"></video>
 </div>
 
 <script>
+    // 1. Инициализация переменных
+    const urlParams = new URLSearchParams(window.location.search);
+    const room = urlParams.get('room') || 'default';
+    document.getElementById('rname').innerText = room;
+
+    window.pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    // 2. Настройка обработчиков PeerConnection
+    window.pc.oniceconnectionstatechange = () => console.log("📍 ICE Status:", window.pc.iceConnectionState);
+    window.pc.onsignalingstatechange = () => console.log("💡 Signaling:", window.pc.signalingState);
+
+    window.pc.ontrack = (event) => {
+        console.log("📺 ПОЛУЧЕН ТРЕК ОТ СЕРВЕРА");
+        if (document.getElementById(event.streams[0].id)) return;
+        const v = document.createElement('video');
+        v.id = event.streams[0].id;
+        v.srcObject = event.streams[0];
+        v.autoplay = true;
+        v.playsinline = true;
+        v.style.width = "300px";
+        v.style.border = "2px solid green";
+        document.getElementById('grid').appendChild(v);
+    };
+
+    // 3. Основная логика запуска
     async function start() {
-        const pc = new RTCPeerConnection({
-            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-        });
+        try {
+            // Захватываем камеру
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+            console.log("📷 Камера получена, треков:", stream.getVideoTracks().length);
+            document.getElementById('local').srcObject = stream;
 
-        // Обработка входящего потока
-        pc.ontrack = (event) => {
-            console.log("📥 Пришел трек от сервера:", event.track.kind);
-            const remoteVideo = document.getElementById('remoteVideo');
-            if (!remoteVideo.srcObject) {
-                remoteVideo.srcObject = new MediaStream();
-            }
-            remoteVideo.srcObject.addTrack(event.track);
-            remoteVideo.play().catch(e => console.error("Play error:", e));
-        };
+            // Добавляем треки ДО создания оффера
+            stream.getTracks().forEach(track => window.pc.addTrack(track, stream));
 
-        // 1. Получаем доступ к камере
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-        document.getElementById('localVideo').srcObject = stream;
+            // Открываем WebSocket
+            const ws = new WebSocket(`ws://${location.host}/ws?room=${room}`);
 
-        // 2. Добавляем треки и настраиваем кодеки
-        stream.getTracks().forEach(track => {
-            const transceiver = pc.addTransceiver(track, {
-                direction: 'sendrecv',
-                streams: [stream]
-            });
-
-            // ФИКС КОДЕКОВ: Заставляем использовать базовый H.264
-            if (RTCRtpReceiver.getCapabilities) {
-                const capabilities = RTCRtpReceiver.getCapabilities('video');
-                const codecs = capabilities.codecs.filter(c =>
-                    c.mimeType === 'video/H264' &&
-                    c.sdpFmtpLine && c.sdpFmtpLine.includes('profile-level-id=42e01f')
-                );
-                if (codecs.length > 0) {
-                    transceiver.setCodecPreferences(codecs);
-                    console.log("✅ Кодек H.264 Baseline установлен");
+            window.pc.onicecandidate = (e) => {
+                if (e.candidate && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
                 }
-            }
-        });
+            };
 
-        // 3. Signaling
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+            ws.onopen = async () => {
+                console.log("🔌 WS открыт, создаем Offer...");
+                const offer = await window.pc.createOffer();
 
-        const response = await fetch('/webrtc', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(pc.localDescription)
-        });
+                if (!offer.sdp.includes("m=video")) {
+                    console.error("❌ КРИТИЧЕСКАЯ ОШИБКА: В SDP нет видео-секции!");
+                }
 
-        const answer = await response.json();
-        await pc.setRemoteDescription(answer);
+                await window.pc.setLocalDescription(offer);
+                ws.send(JSON.stringify({ type: 'offer', sdp: window.pc.localDescription.sdp }));
+            };
 
-        console.log("🚀 Соединение установлено");
+            ws.onmessage = async (e) => {
+                const msg = JSON.parse(e.data);
+                console.log("📩 Пришло сообщение:", msg.type);
+
+                if (msg.type === 'offer') {
+                    await window.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: msg.sdp }));
+                    const answer = await window.pc.createAnswer();
+                    await window.pc.setLocalDescription(answer);
+                    ws.send(JSON.stringify({ type: 'answer', sdp: window.pc.localDescription.sdp }));
+                } else if (msg.type === 'answer') {
+                    await window.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.sdp }));
+                } else if (msg.type === 'candidate') {
+                    await window.pc.addIceCandidate(msg.candidate).catch(console.error);
+                }
+            };
+
+        } catch (err) {
+            console.error("❌ Ошибка старта:", err);
+        }
     }
 
-    start().catch(console.error);
+    start();
 </script>
 </body>
 </html>
