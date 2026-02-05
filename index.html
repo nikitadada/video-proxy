@@ -25,9 +25,13 @@
 
     window.pc.ontrack = (event) => {
         console.log("📺 ПОЛУЧЕН ТРЕК ОТ СЕРВЕРА");
+        const streamId = event.streams[0].id;
         if (document.getElementById(event.streams[0].id)) return;
         const v = document.createElement('video');
-        v.id = event.streams[0].id;
+        v.id = streamId;
+        // Мы сохраним peerId в атрибуте, чтобы потом найти именно это видео
+        v.setAttribute("data-peer-id", event.track.id);
+
         v.srcObject = event.streams[0];
         v.autoplay = true;
         v.playsinline = true;
@@ -81,6 +85,16 @@
                     await window.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.sdp }));
                 } else if (msg.type === 'candidate') {
                     await window.pc.addIceCandidate(msg.candidate).catch(console.error);
+                } else if (msg.type === 'peer-left') {
+                    console.log("Удаляем участника:", msg.peerId);
+                    // Ищем все видео, которые не local, и проверяем их источники
+                    const videos = document.querySelectorAll('video:not(#local)');
+                    videos.forEach(v => {
+                        // Если ID потока или специальный атрибут совпадает с ушедшим
+                        if (v.id.includes(msg.peerId) || v.srcObject.id.includes(msg.peerId)) {
+                            v.remove();
+                        }
+                    });
                 }
             };
 

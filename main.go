@@ -18,6 +18,7 @@ type SignalMessage struct {
 	Type      string                   `json:"type"`
 	SDP       string                   `json:"sdp,omitempty"`
 	Candidate *webrtc.ICECandidateInit `json:"candidate,omitempty"`
+	PeerID    string                   `json:"peerId,omitempty"` // Добавили явно
 }
 
 type Peer struct {
@@ -68,6 +69,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	room := getOrCreateRoom(roomID)
 	peer := &Peer{id: peerID, pc: pc, ws: ws}
+
+	defer func() {
+		room.Lock()
+		delete(room.peers, peerID)
+
+		leaveMsg := SignalMessage{
+			Type:   "peer-left",
+			PeerID: peerID, // Передаем ID ушедшего
+		}
+
+		for _, p := range room.peers {
+			_ = p.ws.WriteJSON(leaveMsg)
+		}
+		room.Unlock()
+		pc.Close()
+	}()
 
 	// 3. Настраиваем отправку кандидатов (Trickle ICE)
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
