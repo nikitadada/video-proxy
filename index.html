@@ -24,19 +24,22 @@
     window.pc.onsignalingstatechange = () => console.log("💡 Signaling:", window.pc.signalingState);
 
     window.pc.ontrack = (event) => {
-        console.log("📺 ПОЛУЧЕН ТРЕК ОТ СЕРВЕРА");
-        const streamId = event.streams[0].id;
-        if (document.getElementById(event.streams[0].id)) return;
-        const v = document.createElement('video');
-        v.id = streamId;
-        // Мы сохраним peerId в атрибуте, чтобы потом найти именно это видео
-        v.setAttribute("data-peer-id", event.track.id);
+        console.log("📺 ПОЛУЧЕН ТРЕК ОТ СЕРВЕРА:", event.track.id);
 
-        v.srcObject = event.streams[0];
+        // Идентифицируем по ID трека, он всегда уникален
+        const trackId = event.track.id;
+        console.log("📺 Получен трек:", trackId);
+
+        if (document.getElementById(trackId)) return;
+
+        const v = document.createElement('video');
+        v.id = trackId; // Привязываем ID к треку
+        v.srcObject = event.streams[0]; // Берем первый стрим
         v.autoplay = true;
         v.playsinline = true;
         v.style.width = "300px";
         v.style.border = "2px solid green";
+        v.style.margin = "5px";
         document.getElementById('grid').appendChild(v);
     };
 
@@ -86,12 +89,11 @@
                 } else if (msg.type === 'candidate') {
                     await window.pc.addIceCandidate(msg.candidate).catch(console.error);
                 } else if (msg.type === 'peer-left') {
-                    console.log("Удаляем участника:", msg.peerId);
-                    // Ищем все видео, которые не local, и проверяем их источники
+                    console.log("Удаляем участника:", msg.peerId); // 'p' - строчная
                     const videos = document.querySelectorAll('video:not(#local)');
                     videos.forEach(v => {
-                        // Если ID потока или специальный атрибут совпадает с ушедшим
-                        if (v.id.includes(msg.peerId) || v.srcObject.id.includes(msg.peerId)) {
+                        // Проверяем id видео или id стрима
+                        if (v.id.includes(msg.peerId) || (v.srcObject && v.srcObject.id.includes(msg.peerId))) {
                             v.remove();
                         }
                     });

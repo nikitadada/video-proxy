@@ -2,12 +2,14 @@ package main
 
 import (
 	"fmt"
-	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v4"
+	"github.com/pion/rtcp"
 	"log"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
 )
 
 var upgrader = websocket.Upgrader{
@@ -18,7 +20,7 @@ type SignalMessage struct {
 	Type      string                   `json:"type"`
 	SDP       string                   `json:"sdp,omitempty"`
 	Candidate *webrtc.ICECandidateInit `json:"candidate,omitempty"`
-	PeerID    string                   `json:"peerId,omitempty"` // Добавили явно
+	PeerID    string                   `json:"peerId,omitempty"`
 }
 
 type Peer struct {
@@ -65,20 +67,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	pc, _ := webrtc.NewPeerConnection(webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
 	})
-	defer pc.Close()
 
+	// ОСТАВЛЯЕМ ТОЛЬКО ОДИН DEFER В КОНЦЕ
 	room := getOrCreateRoom(roomID)
 	peer := &Peer{id: peerID, pc: pc, ws: ws}
 
 	defer func() {
+		fmt.Printf("❌ %s покинул комнату\n", peerID)
 		room.Lock()
 		delete(room.peers, peerID)
-
-		leaveMsg := SignalMessage{
-			Type:   "peer-left",
-			PeerID: peerID, // Передаем ID ушедшего
-		}
-
+		leaveMsg := SignalMessage{Type: "peer-left", PeerID: peerID}
 		for _, p := range room.peers {
 			_ = p.ws.WriteJSON(leaveMsg)
 		}
@@ -95,11 +93,18 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = ws.WriteJSON(SignalMessage{Type: "candidate", Candidate: &candidate})
 	})
 
-	// 4. Логика обработки входящего трека
 	pc.OnTrack(func(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		log.Printf("🎥 Получен трек от %s", peerID)
-		localTrack, _ := webrtc.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, "video", peerID)
+		localTrack, _ := webrtc.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, peerID, peerID)
 		peer.track = localTrack
+
+		// Запрашиваем ключевой кадр, чтобы видео появилось сразу
+		go func() {
+			ticker := time.NewTicker(time.Second * 3)
+			for range ticker.C {
+				_ = pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remoteTrack.SSRC())}})
+			}
+		}()
 
 		room.Lock()
 		for _, p := range room.peers {
@@ -121,7 +126,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
-	// 5. Подписка на уже существующих участников комнаты
+	// Подписка новичка на старичков
 	room.Lock()
 	for _, p := range room.peers {
 		if p.track != nil {
@@ -131,27 +136,39 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	room.peers[peerID] = peer
 	room.Unlock()
 
-	defer func() {
-		room.Lock()
-		delete(room.peers, peerID)
-		room.Unlock()
-		log.Printf("❌ %s покинул комнату", peerID)
-	}()
-
-	// 6. Цикл чтения сообщений (ЕДИНСТВЕННЫЙ блокирующий процесс здесь)
 	for {
 		var msg SignalMessage
 		if err := ws.ReadJSON(&msg); err != nil {
-			log.Printf("Read error: %v", err)
 			break
 		}
 
 		switch msg.Type {
+		// ... внутри handleWebSocket в блоке switch msg.Type ...
 		case "offer":
-			_ = pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: msg.SDP})
+			// 1. ПРОВЕРКА: Если это первый оффер от новичка, подписываем его на всех
+			// Мы проверяем количество сендеров: если их мало, значит мы еще не подписывали его
+			if len(pc.GetSenders()) <= 1 {
+				room.RLock()
+				for id, p := range room.peers {
+					if id != peerID && p.track != nil {
+						log.Printf("🔌 Подписываем новичка %s на трек участника %s", peerID, id)
+						pc.AddTrack(p.track)
+					}
+				}
+				room.RUnlock()
+			}
+
+			// 2. Устанавливаем Offer и создаем Answer (теперь в Answer будут ВСЕ треки комнаты)
+			pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: msg.SDP})
 			answer, _ := pc.CreateAnswer(nil)
-			_ = pc.SetLocalDescription(answer)
-			_ = ws.WriteJSON(SignalMessage{Type: "answer", SDP: answer.SDP})
+
+			// Ждем сбора кандидатов (Gathering) для стабильности
+			gatherComplete := webrtc.GatheringCompletePromise(pc)
+			pc.SetLocalDescription(answer)
+			<-gatherComplete
+
+			ws.WriteJSON(SignalMessage{Type: "answer", SDP: pc.LocalDescription().SDP})
+
 		case "answer":
 			_ = pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: msg.SDP})
 		case "candidate":
